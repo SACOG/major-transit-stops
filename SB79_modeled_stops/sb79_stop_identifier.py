@@ -1,16 +1,15 @@
 """
-Name: major_stop_identifier.py
-Purpose: Using language from CA Public Resource Code Section 21064.3, tag applicable SACSIM bus stops as being major bus stops, which include:
-    -rail stops,
-    -BRT stops (as of 12/16/2024, BRT = 15min or less headways AND served by bus-only lanes), OR
-    -stops serving 2 or more local bus routes (non-BRT) with headway <=20mins in both AM and PM peak periods.
-        NOTE - in some cases, a slightly higher max (e.g. 17mins) is used to account for "shoulder effect",
-        e.g., for 5am-9am period, some routes start 15min service at 5:30am, so although technically their 5am-9am headway is 
-        >15mins, from a standpoint of the policy purpose of frequency, we consider them to be 15min headways.
+Name: sb79_stop_identifier.py
+Purpose: Very similar to AB2097_modeled_stops, except:
+    -does not include all rail stops; just rail stops with >24 trains/day
+    -adds "tier" flag
+
+    IDEA 6/4/2025 - could parts of this script be combined with AB2097 script to have "master major stops" tool,
+    with separate fields for SB79 AB2097 etc? Or is better to keep them separate.
 
 
 Author: Darren Conly
-Last Updated: Jan 2025
+Last Updated: June 2025
 Updated by: 
 Copyright:   (c) SACOG
 Python Version: 3.x
@@ -20,6 +19,7 @@ import datetime as dt
 
 import arcpy
 arcpy.env.overwriteOutput = True
+from arcgis.features import GeoAccessor, GeoSeriesAccessor
 
 import pandas as pd
 pd.options.mode.chained_assignment = None # suppresses "settingwithcopy warning"
@@ -53,10 +53,18 @@ class HQTransitStops:
         self.node_data = self.tranline_data.node_rows
         self.fnames_node_data = self.tranline_data.node_attrs_out_order
 
-        self.color_brt = 4
+        # {headway field: headway period duration}
+        self.headway_info = {self.tranline_data.headway1: 240, self.tranline_data.headway2: 360,
+                            self.tranline_data.headway3: 180, self.tranline_data.headway4: 120,
+                            self.tranline_data.headway5: 240}
+        self.headway_cols = list(self.headway_info.keys())
+
+        self.f_color = self.tranline_data.color
+        self.color_commrail = 6
         self.mode_rail = 1
         self.dir_tags = ['_A', '_B']
         self.f_name_nodir = 'LNAME_NODIR'
+        self.f_corrname = 'LN_CORR_NAME'
         self.f_buslane = 'BUSLANE'
         self.f_nodeid = self.tranline_data.f_node_attrname
 
@@ -74,26 +82,36 @@ class HQTransitStops:
         if in_str[-2:] in self.dir_tags:
             out_str = in_str[:-2]
         return out_str
+    
+
+    def get_daily_trips(self, in_df):
+
+        self.f_daytrips = 'day_trips'
+        in_df[self.f_daytrips] = 0.0
+
+        for fname, durn in self.headway_info.items():
+            in_df.loc[in_df[fname] > 0, self.f_daytrips] += durn / in_df[fname]
+
 
     def create_line_df(self):
         # for line table, only keep fields for line name, mode, color, headway1, headway3
 
         linecols = [self.tranline_data.f_linename, self.tranline_data.mode,
-                    self.tranline_data.color, self.tranline_data.headway1, 
-                    self.tranline_data.headway3]
+                    self.tranline_data.color, *self.headway_cols]
 
         df_lines = pd.DataFrame(self.line_data)[linecols]
+        
+        self.get_daily_trips(df_lines)
 
         # Add field to line df that strips direction tag (_A, _B) from line name
         df_lines[self.f_name_nodir] = df_lines[self.tranline_data.f_linename] \
                                         .apply(lambda x: self.strip_dirtag(x))
 
         # Create consolidated lines df that is only unique lines after having direction stripped
-        df_lines_nodir_cols = [self.tranline_data.mode, self.tranline_data.color, 
-                            self.tranline_data.headway1, self.tranline_data.headway3]
-
-        # df_lines_out = df_lines_hq.groupby(self.f_name_nodir)[df_lines_nodir_cols].min().reset_index()
-        df_lines_out = df_lines.groupby(self.f_name_nodir)[df_lines_nodir_cols].min().reset_index()
+        aggdict = {hwcol: 'min' for hwcol in self.headway_cols}
+        aggdict.update({self.f_daytrips: 'sum'})
+        gbcols = [self.f_name_nodir, self.tranline_data.mode, self.tranline_data.color]
+        df_lines_out = df_lines.groupby(gbcols).agg(aggdict).reset_index()
 
         return df_lines_out
         
@@ -123,7 +141,6 @@ class HQTransitStops:
         # For each node ID:
         f_node = self.tranline_data.f_node_attrname
         f_mode = self.tranline_data.mode
-        # f_color = self.tranline_data.color
         f_name = self.f_name_nodir
 
         self.rail_exceptions_trimmed = [self.strip_dirtag(n) for n in self.rail_exceptions]
@@ -132,119 +149,40 @@ class HQTransitStops:
         # df_node = filter dfjoin to only have rows with node ID
         df_node = df_lnd_data.loc[df_lnd_data[f_node] == node_id]
 
-        # df_node_rail = filter df_node to only have rows where MODE is for rail or where NAME is in list of "rail coded as express bus" routes, like Amtrak
-        #         ***NOTE - will manually need to convert some Amtrak routes to rail after the fact because
-        #             they're coded with mode as commuter bus
-        df_node_rail = df_node.loc[(df_node[f_mode] == self.mode_rail) \
+        df_node_anyrail = df_node.loc[(df_node[f_mode] == self.mode_rail) \
                             | (df_node[f_name].isin(self.rail_exceptions_trimmed))]
+        
+        # df_node_lrt = lrt stations only (MODE=1)
+        df_node_lrt = df_node.loc[(df_node[f_mode] == self.mode_rail)]
 
-        # OLD df_node_brt = filter df_node to only have rows where color is BRT 
-        # df_node_brt = df_node.loc[(df_node[f_color] == self.color_brt)]
 
-        # NEW - find rows that count as BRT major stops where both served by bus-only lane and where headway is meets frequency threshold
+        # Find rows that count as BRT major stops where both served by bus-only lane and where headway is meets frequency threshold
         df_node_brt = df_node.loc[(df_node[f_mode] != self.mode_rail) # non-rail 
                                     & (~df_node[f_name].isin(self.rail_exceptions_trimmed)) # non-rail-exception
                                     & (df_node[self.tranline_data.headway3] > 0) & (df_node[self.tranline_data.headway3] <= self.hifreq_brt_th) # hi-freq in AM
                                     & (df_node[self.tranline_data.headway1] > 0) & (df_node[self.tranline_data.headway1] <= self.hifreq_brt_th)  # hi_freq in PM
                                     & (df_node[self.f_buslane] > 0) # served by buslanes
                                 ]
-
-        # df_node_hifreq = filter df_node to only have rows where COLOR is not BRT and MODE is not rail and it's not an AMTRAK exception
-        # UPDATE 10/25/2024 - want to still flag hi-freq intersections where it's BRT, because of shifting definitions of BRT. But
-        # want to be sure that these are counted as major due to frequency regardless of whether lines COLORed as BRT are BRT from legal standpoint.
-
-        df_node_hifreq = df_node.loc[(df_node[f_mode] != self.mode_rail)
-                                    & (~df_node[f_name].isin(self.rail_exceptions_trimmed))
-                                    & (df_node[self.tranline_data.headway3] > 0) & (df_node[self.tranline_data.headway3] <= self.hifreq_ix_th)
-                                    & (df_node[self.tranline_data.headway1] > 0) & (df_node[self.tranline_data.headway1] <= self.hifreq_ix_th)
-                                ]
+        
+        # get number of bidirectional total daily commuter trips
+        # must agg by corridor flag if 2 comm rail routes can have trips combined (e.g., short v long versions of cap corridor)
+        commrail_trips = 0
+        commrail_stns = df_node[df_node[self.f_color] == self.color_commrail]
+        if commrail_stns.shape[0] > 0:
+            commrail_trips = commrail_stns.groupby(self.f_corrname)[self.f_daytrips].max().values[0]
 
         all_lines = ';'.join(df_node[f_name]) if df_node.shape[0] > 0 else ''
-        rail_lines = ';'.join(df_node_rail[f_name]) if df_node_rail.shape[0] > 0 else ''
+        rail_lines = ';'.join(df_node_anyrail[f_name]) if df_node_anyrail.shape[0] > 0 else ''
+        lrt_lines = ';'.join(df_node_lrt[f_name]) if df_node_lrt.shape[0] > 0 else ''
         brt_lines = ';'.join(df_node_brt[f_name]) if df_node_brt.shape[0] > 0 else ''
-        hi_freq_lines = ';'.join(df_node_hifreq[f_name]) if df_node_hifreq.shape[0] >= 1 else ''
-        cnt_hifreqlines = df_node_hifreq.shape[0]
 
 
         out_data = {self.tranline_data.f_node_attrname: node_id, 
-            self.k_all_lines: all_lines, self.k_rail_lines: rail_lines, self.k_brt_lines: brt_lines,
-            self.k_hi_freq_lines: hi_freq_lines, self.k_cnt_hifreqlines: cnt_hifreqlines}
+            self.k_all_lines: all_lines, self.k_rail_lines: rail_lines, self.k_lrt_lines: lrt_lines, 
+            self.k_brt_lines: brt_lines, self.k_commrail_trips: commrail_trips}
 
         return out_data
 
-    def compare_lists(self, l1, l2):
-        # compares stop nodes for 2 lines. If all of one line's stops are in
-        # the other line's stop list, or vice-versa, warn that the lines serve
-        # the same stops and that perhaps those stops shouldn't be eligible under SB743
-
-        # NOTE - could have all L1 stops within L2 route, but not vice-versa (e.g. if L1 is short version of L2)
-        # even in this case and with both routes having <20min headways, do not consider separate lines because 
-        # they do not provide hi-freq service to different places, e.g., you have hi-freq service for L2's stops,
-        # and L1's hi frequency does not give you any additional coverage.
-
-        l1_in_l2 = all([i in l2 for i in l1]) # True if all nodes in l1 are in l2
-        l2_in_l1 = all([i in l1 for i in l2]) # True if all in l2 are in l1
-
-        if l1_in_l2 or l2_in_l1:
-            result = True
-        else:
-            result = False
-        
-        return result
-        
-
-    def flag_dup_svc(self, in_hqt_node_df):
-        """
-        # if a node has 2+ hi-freq routes, confirm that there's not perfect overlap. Examples of overlap:
-        route A serves 1-2-3-4 and route B serves 2-3. Nodes 2 and 3 should *not* count as high-quality
-        transit stop because routes A and B do not have substantively different service areas.
-        """
-
-        # get list of nodes where > hi frequency route, no brt, and no rail
-        df_hf = in_hqt_node_df.loc[(in_hqt_node_df[self.k_rail_lines] == '') \
-                                    & (in_hqt_node_df[self.k_brt_lines] == '') \
-                                    & (in_hqt_node_df[self.k_cnt_hifreqlines] > 1)]
-
-        hf_nodes = df_hf[self.tranline_data.f_node_attrname].unique()
-        self.f_overlap = "overlap_lines"
-
-        node_overlap_data = []
-        for node in hf_nodes:
-            # split out the names of the hi-freq routes
-            try:
-                lnames = df_hf.loc[df_hf[self.tranline_data.f_node_attrname] == node][self.k_hi_freq_lines] \
-                    .values[0].split(';')
-            except:
-                import pdb; pdb.set_trace()
-                
-            tdict = {}
-            for lname in lnames:
-                lnodes = list(self.df_nodes.loc[self.df_nodes[self.f_name_nodir] == lname] \
-                    [self.tranline_data.f_node_attrname])
-                tdict[lname] = lnodes
-                
-            overlap_warning = ''
-            for lname in tdict.keys():
-                comparison_lines = [l for l in lnames if l != lname]
-                for l_comp in comparison_lines:
-                    has_overlap = self.compare_lists(tdict[lname], tdict[l_comp])
-                    if has_overlap:
-                        olap = f"{lname}-{l_comp}"
-                        olap_rev = f"{l_comp}-{lname}"
-                        if olap_rev in overlap_warning:
-                            # e.g., if line pair A-B already flagged as overlapping pair, we do not want to also flag B-A.
-                            pass
-                        else:
-                            overlap_warning = f"{overlap_warning}{olap};"
-                            data = [node, overlap_warning]
-                            node_overlap_data.append(data)
-
-        df_node_overlap = pd.DataFrame(node_overlap_data, columns=[self.tranline_data.f_node_attrname, self.f_overlap])
-
-        result_df = in_hqt_node_df.merge(df_node_overlap, on=self.tranline_data.f_node_attrname, how='left')
-        result_df[self.f_overlap].fillna('', inplace=True)
-
-        return result_df
     
     def get_buslane_info(self, transit_node_df, link_qual_threshold=1):
         # tag each node in transit_node_df with 1/0 flag indicating if served 
@@ -290,11 +228,10 @@ class HQTransitStops:
         stopnode_list = list(df_stopnodes[self.tranline_data.f_node_attrname].unique())
         
         self.k_all_lines = "all_lines"
-        self.k_rail_lines = "rail_lines"
+        self.k_rail_lines = 'all_rail_lines'
+        self.k_lrt_lines = "lrt_lines"
         self.k_brt_lines = "brt_lines"
-        self.k_hi_freq_lines = "hifreq_lines"
-        self.k_cnt_hifreqlines = "cnt_hifreqlines"
-        self.k_net_hifreqlines = "net_hifreqlines"
+        self.k_commrail_trips = 'crail_bidir_trps'
         self.k_majstoptyp = 'maj_stop'
 
         # tags
@@ -309,58 +246,95 @@ class HQTransitStops:
         # tag whether each node is served by bus-only lanes
         self.df_linenode_joined = self.get_buslane_info(self.df_linenode_joined)
 
+        self.add_corridor_lname(self.df_linenode_joined)
+
         node_svc_data = []
         for node in stopnode_list:
             node_data = self.get_node_svc_data(self.df_linenode_joined, node)
             node_svc_data.append(node_data)
 
-        self.df_hqt_nodes = pd.DataFrame(node_svc_data)
-        self.final_df = self.flag_dup_svc(self.df_hqt_nodes)
+        self.final_df = pd.DataFrame(node_svc_data)
         self.final_df[self.tranline_data.f_node_attrname] = self.final_df[self.tranline_data.f_node_attrname].astype('int')
 
         # consolidate to single field that identifies what type of major stop it is
         self.final_df[self.k_majstoptyp] = self.not_maj # default value: not a major transit stop
         self.final_df.loc[~self.final_df[self.k_rail_lines].isin(["", " "]), self.k_majstoptyp] = self.maj_rail
         self.final_df.loc[~self.final_df[self.k_brt_lines].isin(["", " "]), self.k_majstoptyp] = self.maj_brt
-        
-        def get_hifreq_ix(row):
-            # tag as intersection of hi-freq lines if served by 2+ lines and those lines do not overlap too much.
-            # notably, this function will not overwrite other major stop types. E.g., if stop already tagged as BRT, it will not overwrite the BRT tag.
-
-            if (row[self.k_cnt_hifreqlines] > 1) & (row[self.k_majstoptyp] == self.not_maj):
-                if (row[self.f_overlap] != ''):
-                    # only apply this to stops that have >1 hifreq line and non-null risk of overlap
-                    osplit = [i for i in row[self.f_overlap].split(';') if len(i) > 0] # list of potential overlap routes
-                    hfl_list = row[self.k_hi_freq_lines].split(';') # list of hi-freq routes, including those that are overlapping
-
-                    for lpair in osplit:
-                        l1 = lpair.split('-')[0]
-                        l2 = lpair.split('-')[1]
-                        hfl_list = [i for i in hfl_list if i not in [l1, l2]] 
-                        hfl_list.append(lpair)
-
-                    if len(hfl_list) > 1:
-                        row[self.k_majstoptyp] = self.maj_ix
-                    
-                    row[self.k_net_hifreqlines] = len(hfl_list)
-                else:
-                    # if >1 hifreq line but no overlap risk, set as major intersection
-                    row[self.k_majstoptyp] = self.maj_ix
-            else:
-                pass
-
-            return row
-
-        # get more accurate determination of 2+ lines after removing potential overlapping lines that are more effecively just one line
-        # e.g. routes P/Q in Davis, which are 2 hi-freq routes but are just opposite directions of same loop, so effectively one route
-        self.final_df[self.k_net_hifreqlines] = self.final_df[self.k_cnt_hifreqlines]
-        self.final_df = self.final_df.apply(get_hifreq_ix, axis=1)
 
         if not self.keep_all:
             # option to exclude non-major stops from output
             self.final_df = self.final_df.loc[(self.final_df[self.k_majstoptyp] != 'Non-major stop')]
+
+        self.final_df = self.add_spatial_data(self.final_df)
+
+        self.final_df = self.add_urb_county_tag(self.final_df)
+
+        self.f_tier = 'sb79tier'
+        self.final_df[self.f_tier] = 0 # by default, no SB79 nodes
+        self.final_df[self.f_tier] = self.final_df.apply(lambda x: self.get_sb79_tier(x), axis=1)
         
         return self.final_df
+    
+    def get_sb79_tier(self, node_data):
+
+        lrt_stop = node_data[self.k_lrt_lines] != ''
+        brt_stop = node_data[self.k_brt_lines] != ''
+        hfreq_commrail = node_data[self.k_commrail_trips] >= 48
+        freq_commrail = node_data[self.k_commrail_trips] >= 24
+
+        # no tier 1 nodes in SACOG region
+
+        tier = 0
+
+        if any([lrt_stop, brt_stop, hfreq_commrail, freq_commrail]):
+            """Tier 3 = a transit-oriented development stop within an urban transit county not already covered by Tier 2 criteria, 
+            served by frequent commuter rail service; or any transit-oriented development stop not within an urban transit county; 
+            or any major transit stop otherwise so designated by the applicable authority."""
+            tier = 3
+        
+        if node_data[self.f_urb_county] == 1 \
+            and any([lrt_stop, brt_stop, hfreq_commrail]):
+            """Tier 2 = stop within an urban transit county, excluding a Tier 1 transit-oriented development stop, 
+            served by light rail transit, by high-frequency commuter rail, 
+            or by bus service with headways <15mins and dedicated lanes. 
+            """
+            tier = 2
+        
+        return tier
+
+
+
+    
+    def add_corridor_lname(self, in_df):
+        # tag if 2+ lines can have their trips combined for purposes of determining commuter route frequency.
+        # e.g., AMTRCC and AMTRCCS can sum their trips together if there's total overlap, e.g., between SVS and Davis
+
+        in_df[self.f_corrname] = in_df[self.f_name_nodir]
+
+        lnames = in_df[self.f_name_nodir].drop_duplicates()
+        for lname in lnames:
+            lnodes = in_df[in_df[self.f_name_nodir] == lname][self.f_nodeid].values
+
+            lnames2 = in_df[in_df[self.f_name_nodir] != lname][self.f_name_nodir].drop_duplicates()
+            for lname2 in lnames2:
+                lnodes2 = in_df[in_df[self.f_name_nodir] == lname2][self.f_nodeid].values
+                l1_in_l2 = all([i in lnodes2 for i in lnodes]) # True if all nodes in l1 are in l2
+                l2_in_l1 = all([i in lnodes for i in lnodes2]) # True if all in l2 are in l1
+                
+                if l1_in_l2:
+                    # if all line 1's nodes within line 2, then the corridor name will be line 1
+                    corr_nodes = in_df[in_df[self.f_name_nodir] == lname][self.f_nodeid].values
+                    in_df.loc[(in_df[self.f_name_nodir].isin([lname, lname2])) \
+                              & (in_df[self.f_nodeid].isin(corr_nodes)), self.f_corrname] = lname
+                elif l2_in_l1:
+                    # if all line 2's nodes within line 1, then the corridor name will be line 2
+                    corr_nodes = in_df[in_df[self.f_name_nodir] == lname2][self.f_nodeid].values
+                    in_df.loc[in_df[self.f_nodeid].isin(corr_nodes), self.f_corrname] = lname2
+                else:
+                    # if not total overlap in either way, then skip
+                    continue
+
+
     
     def manual_stop_add(self, sedf_in, stops_csv, csv_crs_id=4326):
         # manually add stops that are not in SACSIM stop network (e.g., Colfax train station)
@@ -372,11 +346,10 @@ class HQTransitStops:
         df_out = pd.concat([sedf_in, sdf_stops])
 
         return df_out
-
-    def export_to_esri_fc(self, output_gdb):
+    
+    def add_spatial_data(self, in_df):
         """Join table of high-qual transit stops to X/Y data for each node from
-        Cube hwy net, then export to SHP"""
-        from arcgis.features import GeoAccessor, GeoSeriesAccessor
+        Cube hwy net"""
 
         node_x = 'X'
         node_y = 'Y'
@@ -384,35 +357,51 @@ class HQTransitStops:
         hwy_node_dbf = npc.net2dbf(self.hwy_net, scenario_prefix=self.scen_yr, skip_if_exists=True)
         df_hwynodes = esri_object_to_df(in_esri_obj=hwy_node_dbf, esri_obj_fields=hwy_node_fields)
         
-        sedf_join = df_hwynodes.merge(self.final_df, on=self.tranline_data.f_node_attrname)
+        sedf_join = df_hwynodes.merge(in_df, on=self.tranline_data.f_node_attrname)
         sedf_out = pd.DataFrame.spatial.from_xy(sedf_join, x_column=node_x, y_column=node_y, sr=self.sr_sacog)
-        sedf_out[self.f_overlap] = sedf_out[self.f_overlap].fillna('')
 
         if self.addstops_csv: 
             sedf_out = self.manual_stop_add(sedf_out, self.addstops_csv)
 
+        return sedf_out
+    
+    def add_urb_county_tag(self, sedf):
+        # "urban transit counties", as of 6/4/2025, are those with 15 or more rail stations in them
+        fc_counties = r'I:\Projects\Darren\2025BlueprintTables\Blueprint_Table_GIS\winuser@GISData.sde\GISOWNER.AdministrativeBoundaries\GISOWNER.Counties'
+        f_cname = 'COUNTY'
+        
+        self.f_urb_county = 'sb79_urbcnty'
+        sedf[self.f_urb_county] = 0 # by default, stop is not in "urban transit county"
+
+        # identify which counties qualify as "urban transit counties"
+        sedf_counties = pd.DataFrame.spatial.from_featureclass(fc_counties)[['SHAPE', f_cname]]
+        sedf = sedf.spatial.join(sedf_counties)
+
+        railstop_x_county = sedf[sedf[self.k_lrt_lines] != ''].groupby(f_cname)[self.k_lrt_lines].count().to_dict()
+        urb_counties = [county for county in railstop_x_county.keys() if railstop_x_county[county] > 15]
+
+        # tag which stops are in urban transit county
+        sedf.loc[sedf[f_cname].isin(urb_counties), self.f_urb_county] = 1
+
+        return sedf
+
+    def export_to_esri_fc(self, sedf, output_gdb):
+        """Join table of high-qual transit stops to X/Y data for each node from
+        Cube hwy net, then export to SHP"""
+
         self.scen = Path(self.in_tranline_txt).stem
         self.tsufx = str(dt.datetime.now().strftime('%Y%m%d_%H%M'))
-        out_fc = f"HQTStops_{self.scen}{self.tsufx}"
+        out_fc = f"SB79Stops_{self.scen}{self.tsufx}"
         out_path = str(Path(output_gdb).joinpath(out_fc))
-        sedf_out.spatial.to_featureclass(out_path, sanitize_columns=False)
+        sedf.spatial.to_featureclass(out_path, sanitize_columns=False)
 
-        user_msg = f"""Success! Output file is {out_path}
-        
-        WARNING: FINAL INSPECTIONS NEEDED:
-            1. Nodes that have a value for the {self.f_overlap} field do not qualify as high-quality
-                if they are served only by two non-rail, non-BRT, hi-frequency bus lines whose routes completely overlap.
-            2. Make a general scan and make sure that nodes are reasonably close to real streets. Remember that high-quality
-                stop locations dictate state-enforced land use regulations. 
-            3. There are may be exceptions to this script's rules. Any maps should be vetted with local jursidictions
-                and transit operators before external release.
-            """
+        user_msg = f"""Success! Output file is {out_path}"""
         arcpy.AddMessage(user_msg)
 
         return out_path
 
     def export_to_csv(self, output_dir):
-        out_csv = f"HQTStops_{self.scen}{self.tsufx}"        
+        out_csv = f"SB79Stops_{self.scen}{self.tsufx}"        
         self.final_df.to_csv(Path(output_dir).joinpath(out_csv), index=False)
 
 
@@ -423,20 +412,20 @@ if __name__ == '__main__':
     out_gdb = input("Enter path to output file geodatabase: ").strip("\"")
 
     # primary inputs - hard-coded for testing
-    # model_run_dir = r'\\win11-model-2\D\SACSIM23\2050\DPS\run_2050_DSPv07_narrow_S3_1_AOC186_SCS2c\run_2050_DSPv07_narrow_S3_1_AOC186_SCS2c'
+    # model_run_dir = r'\\win11-model-1\D\SACSIM23\2050\DPS\2050_109_WAH3.5_FullTele23.5\run_folder'
     # sc_yr = 2050
     # out_gdb = r'I:\Projects\Darren\HiFrequencyTransit\HiFrequencyTransit.gdb'
 
     # CSV of stops that qualify as major but are not included in SACSIM (e.g. Colfax Amtrak station, possibly TRPA BRT stops)
-    stops_to_add = Path(__file__).parent.joinpath('extra_major_transtops.csv')
+    stops_to_add = None # Path(__file__).parent.joinpath('extra_major_transtops.csv')
 
-    keep_all_nodes = False # do you want final outputs to keep all transit nodes? Or just those with qualifying HQT?
-    buffer_dist_ft = 2640 # set to None if you do not want a buffer createdf
+    keep_all_nodes = True # do you want final outputs to keep all transit nodes? Or just those with qualifying HQT?
+    buffer_dist_ft = None # set to None if you do not want a buffer createdf
 
     #======================================
     hqts = HQTransitStops(model_run_dir, scen_yr=sc_yr, keep_all=keep_all_nodes, addstops_csv=stops_to_add)
-    hqts.make_hq_stop_df()
-    point_fc_path = hqts.export_to_esri_fc(output_gdb=out_gdb)
+    final_stopsdf = hqts.make_hq_stop_df()
+    point_fc_path = hqts.export_to_esri_fc(final_stopsdf, output_gdb=out_gdb)
 
     if buffer_dist_ft:
         arcpy.AddMessage(f"Creating {buffer_dist_ft}ft buffer...")

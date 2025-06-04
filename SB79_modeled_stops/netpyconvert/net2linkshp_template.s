@@ -1,0 +1,7 @@
+RUN PGM=NETWORK
+
+FILEI LINKI[1]="{input_net}"
+FILEO LINKO="{output_path}" FORMAT=SHP
+
+ENDRUN
+
