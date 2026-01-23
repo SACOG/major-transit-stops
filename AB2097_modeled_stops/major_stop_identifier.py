@@ -418,14 +418,14 @@ class HQTransitStops:
 
 if __name__ == '__main__':
     # primary inputs
-    model_run_dir = input("Enter model run folder path: ").strip("\"")
-    sc_yr = input("Enter scenario year/tag: ")
-    out_gdb = input("Enter path to output file geodatabase: ").strip("\"")
+    #model_run_dir = input("Enter model run folder path: ").strip("\"")
+    #sc_yr = input("Enter scenario year/tag: ")
+    #out_gdb = input("Enter path to output file geodatabase: ").strip("\"")
 
     # primary inputs - hard-coded for testing
-    # model_run_dir = r'\\win11-model-2\D\SACSIM23\2050\DPS\run_2050_DSPv07_narrow_S3_1_AOC186_SCS2c\run_2050_DSPv07_narrow_S3_1_AOC186_SCS2c'
-    # sc_yr = 2050
-    # out_gdb = r'I:\Projects\Darren\HiFrequencyTransit\HiFrequencyTransit.gdb'
+    model_run_dir = r'\\win11-model-2\D\SACSIM23\2035\DPS\2035_180_WAH3.5_FullTele23.5\run_folder_comments_09122025_telewrk'#'\\win11-model-2\D\SACSIM23\2020\2020_67_Superwalk3\run_folder'#'\\win11-model-1\D\SACSIM23\2050\DPS\2050_109_WAH3.5_FullTele23.5\run_folder_comments_09122025_telew'
+    sc_yr = 2035
+    out_gdb = r'Q:\SACSIM23\Transit\HFTA_layers_finalized\HFTA_layers_finalized.gdb'
 
     # CSV of stops that qualify as major but are not included in SACSIM (e.g. Colfax Amtrak station, possibly TRPA BRT stops)
     stops_to_add = Path(__file__).parent.joinpath('extra_major_transtops.csv')
@@ -445,7 +445,7 @@ if __name__ == '__main__':
         buff_path = str(pth_pts.parent.joinpath(buff_fc_name))
         arcpy.analysis.Buffer(in_features=point_fc_path, out_feature_class=buff_path, 
                               buffer_distance_or_field=buffer_dist_ft,
-                              dissolve_option='ALL')
+                              dissolve_option='NONE')
     
     print("Script completed!")
 
